@@ -22,29 +22,50 @@ func (s *Stream) GetSpec() interface{} {
 
 // StreamSpec is the spec for a Stream resource
 type StreamSpec struct {
-	Account           string           `json:"account"`
-	Creds             string           `json:"creds"`
-	Description       string           `json:"description"`
-	Discard           string           `json:"discard"`
-	DuplicateWindow   string           `json:"duplicateWindow"`
-	MaxAge            string           `json:"maxAge"`
-	MaxBytes          int              `json:"maxBytes"`
-	MaxConsumers      int              `json:"maxConsumers"`
-	MaxMsgs           int              `json:"maxMsgs"`
-	MaxMsgSize        int              `json:"maxMsgSize"`
-	MaxMsgsPerSubject int              `json:"maxMsgsPerSubject"`
-	Mirror            *StreamSource    `json:"mirror"`
-	Name              string           `json:"name"`
-	Nkey              string           `json:"nkey"`
-	NoAck             bool             `json:"noAck"`
-	Placement         *StreamPlacement `json:"placement"`
-	Replicas          int              `json:"replicas"`
-	Retention         string           `json:"retention"`
-	Servers           []string         `json:"servers"`
-	Sources           []*StreamSource  `json:"sources"`
-	Storage           string           `json:"storage"`
-	Subjects          []string         `json:"subjects"`
-	TLS               TLS              `json:"tls"`
+	Name                   string            `json:"name"`
+	Description            string            `json:"description,omitempty"`
+	Subjects               []string          `json:"subjects,omitempty"`
+	Retention              string            `json:"retention,omitempty"`
+	MaxConsumers           int               `json:"maxConsumers,omitempty"`
+	MaxMsgsPerSubject      int               `json:"maxMsgsPerSubject,omitempty"`
+	MaxMsgs                int               `json:"maxMsgs,omitempty"`
+	MaxBytes               int               `json:"maxBytes,omitempty"`
+	MaxAge                 string            `json:"maxAge,omitempty"`
+	MaxMsgSize             int               `json:"maxMsgSize,omitempty"`
+	Storage                string            `json:"storage,omitempty"`
+	Discard                string            `json:"discard,omitempty"`
+	Replicas               int               `json:"replicas,omitempty"`
+	NoAck                  bool              `json:"noAck,omitempty"`
+	DuplicateWindow        string            `json:"duplicateWindow,omitempty"`
+	Placement              *StreamPlacement  `json:"placement,omitempty"`
+	Mirror                 *StreamSource     `json:"mirror,omitempty"`
+	Sources                []*StreamSource   `json:"sources,omitempty"`
+	Compression            string            `json:"compression,omitempty"`
+	SubjectTransform       *SubjectTransform `json:"subjectTransform,omitempty"`
+	RePublish              *RePublish        `json:"republish,omitempty"`
+	Sealed                 bool              `json:"sealed,omitempty"`
+	DenyDelete             bool              `json:"denyDelete,omitempty"`
+	DenyPurge              bool              `json:"denyPurge,omitempty"`
+	AllowDirect            bool              `json:"allowDirect,omitempty"`
+	AllowRollup            bool              `json:"allowRollup,omitempty"`
+	MirrorDirect           bool              `json:"mirrorDirect,omitempty"`
+	DiscardPerSubject      bool              `json:"discardPerSubject,omitempty"`
+	FirstSequence          uint64            `json:"firstSequence,omitempty"`
+	Metadata               map[string]string `json:"metadata,omitempty"`
+	ConsumerLimits         *ConsumerLimits   `json:"consumerLimits,omitempty"`
+	AllowMsgTTL            bool              `json:"allowMsgTtl,omitempty"`
+	SubjectDeleteMarkerTTL string            `json:"subjectDeleteMarkerTtl,omitempty"`
+	AllowMsgCounter        bool              `json:"allowMsgCounter,omitempty"`
+	AllowAtomicPublish     bool              `json:"allowAtomicPublish,omitempty"`
+	AllowMsgSchedules      bool              `json:"allowMsgSchedules,omitempty"`
+	AllowBatched           bool              `json:"allowBatched,omitempty"`
+	PersistMode            string            `json:"persistMode,omitempty"`
+	BaseStreamConfig
+}
+
+type SubjectTransform struct {
+	Source string `json:"source"`
+	Dest   string `json:"dest"`
 }
 
 type StreamPlacement struct {
@@ -54,12 +75,28 @@ type StreamPlacement struct {
 
 type StreamSource struct {
 	Name          string `json:"name"`
-	OptStartSeq   int    `json:"optStartSeq"`
-	OptStartTime  string `json:"optStartTime"`
-	FilterSubject string `json:"filterSubject"`
+	OptStartSeq   int    `json:"optStartSeq,omitempty"`
+	OptStartTime  string `json:"optStartTime,omitempty"`
+	FilterSubject string `json:"filterSubject,omitempty"`
 
-	ExternalAPIPrefix     string `json:"externalApiPrefix"`
-	ExternalDeliverPrefix string `json:"externalDeliverPrefix"`
+	ExternalAPIPrefix     string `json:"externalApiPrefix,omitempty"`
+	ExternalDeliverPrefix string `json:"externalDeliverPrefix,omitempty"`
+
+	SubjectTransforms []*SubjectTransform   `json:"subjectTransforms,omitempty"`
+	Consumer          *StreamSourceConsumer `json:"consumer,omitempty"`
+}
+
+// StreamSourceConsumer references a durable consumer for stream sourcing
+// or mirroring (nats-server 2.14+).
+type StreamSourceConsumer struct {
+	Name           string `json:"name,omitempty"`
+	DeliverSubject string `json:"deliverSubject,omitempty"`
+}
+
+type RePublish struct {
+	Source      string `json:"source"`
+	Destination string `json:"destination"`
+	HeadersOnly bool   `json:"headers_only,omitempty"`
 }
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object

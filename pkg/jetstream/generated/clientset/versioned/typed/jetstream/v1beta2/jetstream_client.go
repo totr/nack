@@ -1,4 +1,4 @@
-// Copyright 2020 The NATS Authors
+// Copyright 2025 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -16,8 +16,10 @@
 package v1beta2
 
 import (
-	v1beta2 "github.com/nats-io/nack/pkg/jetstream/apis/jetstream/v1beta2"
-	"github.com/nats-io/nack/pkg/jetstream/generated/clientset/versioned/scheme"
+	http "net/http"
+
+	jetstreamv1beta2 "github.com/nats-io/nack/pkg/jetstream/apis/jetstream/v1beta2"
+	scheme "github.com/nats-io/nack/pkg/jetstream/generated/clientset/versioned/scheme"
 	rest "k8s.io/client-go/rest"
 )
 
@@ -25,6 +27,8 @@ type JetstreamV1beta2Interface interface {
 	RESTClient() rest.Interface
 	AccountsGetter
 	ConsumersGetter
+	KeyValuesGetter
+	ObjectStoresGetter
 	StreamsGetter
 }
 
@@ -41,17 +45,37 @@ func (c *JetstreamV1beta2Client) Consumers(namespace string) ConsumerInterface {
 	return newConsumers(c, namespace)
 }
 
+func (c *JetstreamV1beta2Client) KeyValues(namespace string) KeyValueInterface {
+	return newKeyValues(c, namespace)
+}
+
+func (c *JetstreamV1beta2Client) ObjectStores(namespace string) ObjectStoreInterface {
+	return newObjectStores(c, namespace)
+}
+
 func (c *JetstreamV1beta2Client) Streams(namespace string) StreamInterface {
 	return newStreams(c, namespace)
 }
 
 // NewForConfig creates a new JetstreamV1beta2Client for the given config.
+// NewForConfig is equivalent to NewForConfigAndClient(c, httpClient),
+// where httpClient was generated with rest.HTTPClientFor(c).
 func NewForConfig(c *rest.Config) (*JetstreamV1beta2Client, error) {
 	config := *c
-	if err := setConfigDefaults(&config); err != nil {
+	setConfigDefaults(&config)
+	httpClient, err := rest.HTTPClientFor(&config)
+	if err != nil {
 		return nil, err
 	}
-	client, err := rest.RESTClientFor(&config)
+	return NewForConfigAndClient(&config, httpClient)
+}
+
+// NewForConfigAndClient creates a new JetstreamV1beta2Client for the given config and http client.
+// Note the http client provided takes precedence over the configured transport values.
+func NewForConfigAndClient(c *rest.Config, h *http.Client) (*JetstreamV1beta2Client, error) {
+	config := *c
+	setConfigDefaults(&config)
+	client, err := rest.RESTClientForConfigAndClient(&config, h)
 	if err != nil {
 		return nil, err
 	}
@@ -73,17 +97,15 @@ func New(c rest.Interface) *JetstreamV1beta2Client {
 	return &JetstreamV1beta2Client{c}
 }
 
-func setConfigDefaults(config *rest.Config) error {
-	gv := v1beta2.SchemeGroupVersion
+func setConfigDefaults(config *rest.Config) {
+	gv := jetstreamv1beta2.SchemeGroupVersion
 	config.GroupVersion = &gv
 	config.APIPath = "/apis"
-	config.NegotiatedSerializer = scheme.Codecs.WithoutConversion()
+	config.NegotiatedSerializer = rest.CodecFactoryForGeneratedClient(scheme.Scheme, scheme.Codecs).WithoutConversion()
 
 	if config.UserAgent == "" {
 		config.UserAgent = rest.DefaultKubernetesUserAgent()
 	}
-
-	return nil
 }
 
 // RESTClient returns a RESTClient that is used to communicate

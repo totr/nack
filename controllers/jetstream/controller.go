@@ -1,4 +1,4 @@
-// Copyright 2020-2021 The NATS Authors
+// Copyright 2020-2022 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -17,12 +17,14 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/nats-io/jsm.go"
 	jsmapi "github.com/nats-io/jsm.go/api"
 	"github.com/nats-io/nats.go"
+	"github.com/sirupsen/logrus"
 
 	apis "github.com/nats-io/nack/pkg/jetstream/apis/jetstream/v1beta2"
 	clientset "github.com/nats-io/nack/pkg/jetstream/generated/clientset/versioned"
@@ -33,6 +35,7 @@ import (
 
 	k8sapi "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	k8smeta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -73,18 +76,20 @@ type Options struct {
 	NATSCertificate string
 	NATSKey         string
 
+	NATSTLSFirst bool
+
 	Namespace     string
 	CRDConnect    bool
 	CleanupPeriod time.Duration
+	ReadOnly      bool
 
 	Recorder record.EventRecorder
 }
 
 type Controller struct {
-	ctx  context.Context
-	opts Options
-	nc   *nats.Conn
-	jm   *jsm.Manager
+	ctx      context.Context
+	opts     Options
+	connPool *natsConnPool
 
 	ki              k8styped.CoreV1Interface
 	ji              typed.JetstreamV1beta2Interface
@@ -93,13 +98,21 @@ type Controller struct {
 
 	strLister listers.StreamLister
 	strSynced cache.InformerSynced
-	strQueue  workqueue.RateLimitingInterface
+	strQueue  workqueue.TypedRateLimitingInterface[any]
 
 	cnsLister listers.ConsumerLister
 	cnsSynced cache.InformerSynced
-	cnsQueue  workqueue.RateLimitingInterface
+	cnsQueue  workqueue.TypedRateLimitingInterface[any]
 
 	accLister listers.AccountLister
+
+	// Informers for unsupported resources (KeyValue and ObjectStore)
+	// These are only used to emit warnings in legacy mode
+	kvLister listers.KeyValueLister
+	kvSynced cache.InformerSynced
+
+	osLister listers.ObjectStoreLister
+	osSynced cache.InformerSynced
 
 	// cacheDir is where the downloaded TLS certs from the server
 	// will be stored temporarily.
@@ -113,6 +126,8 @@ func NewController(opt Options) *Controller {
 	streamInformer := informerFactory.Jetstream().V1beta2().Streams()
 	consumerInformer := informerFactory.Jetstream().V1beta2().Consumers()
 	accountInformer := informerFactory.Jetstream().V1beta2().Accounts()
+	keyValueInformer := informerFactory.Jetstream().V1beta2().KeyValues()
+	objectStoreInformer := informerFactory.Jetstream().V1beta2().ObjectStores()
 
 	if opt.Recorder == nil {
 		utilruntime.Must(scheme.AddToScheme(k8sscheme.Scheme))
@@ -132,23 +147,61 @@ func NewController(opt Options) *Controller {
 	}
 
 	ji := opt.JetstreamIface.JetstreamV1beta2()
-	streamQueue := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "Streams")
-	consumerQueue := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "Consumers")
+	streamQueue := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[any](), "Streams")
+	consumerQueue := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[any](), "Consumers")
 
-	streamInformer.Informer().AddEventHandler(eventHandlers(
-		opt.Ctx,
-		streamQueue,
-	))
+	streamInformer.Informer().AddEventHandler(
+		eventHandlers(
+			streamQueue,
+		),
+	)
 
-	consumerInformer.Informer().AddEventHandler(eventHandlers(
-		opt.Ctx,
-		consumerQueue,
-	))
+	consumerInformer.Informer().AddEventHandler(
+		eventHandlers(
+			consumerQueue,
+		),
+	)
+
+	// Add warning handlers for unsupported resources in legacy mode
+	keyValueInformer.Informer().AddEventHandler(
+		cache.ResourceEventHandlerFuncs{
+			AddFunc: func(obj interface{}) {
+				if kv, ok := obj.(*apis.KeyValue); ok {
+					klog.Warningf("KeyValue resource %s/%s detected but not supported in legacy mode. The NATS KV bucket will NOT be created. Enable --control-loop mode to use KeyValue resources.", kv.Namespace, kv.Name)
+					opt.Recorder.Event(kv, k8sapi.EventTypeWarning, "NotSupported", "KeyValue resources require --control-loop mode. The NATS KV bucket will NOT be created.")
+				}
+			},
+			UpdateFunc: func(oldObj, newObj interface{}) {
+				if kv, ok := newObj.(*apis.KeyValue); ok {
+					klog.Warningf("KeyValue resource %s/%s updated but not supported in legacy mode. Changes will NOT be applied to NATS. Enable --control-loop mode to use KeyValue resources.", kv.Namespace, kv.Name)
+					opt.Recorder.Event(kv, k8sapi.EventTypeWarning, "NotSupported", "KeyValue resources require --control-loop mode. Updates will NOT be applied.")
+				}
+			},
+		},
+	)
+
+	objectStoreInformer.Informer().AddEventHandler(
+		cache.ResourceEventHandlerFuncs{
+			AddFunc: func(obj interface{}) {
+				if os, ok := obj.(*apis.ObjectStore); ok {
+					klog.Warningf("ObjectStore resource %s/%s detected but not supported in legacy mode. The NATS object store will NOT be created. Enable --control-loop mode to use ObjectStore resources.", os.Namespace, os.Name)
+					opt.Recorder.Event(os, k8sapi.EventTypeWarning, "NotSupported", "ObjectStore resources require --control-loop mode. The NATS object store will NOT be created.")
+				}
+			},
+			UpdateFunc: func(oldObj, newObj interface{}) {
+				if os, ok := newObj.(*apis.ObjectStore); ok {
+					klog.Warningf("ObjectStore resource %s/%s updated but not supported in legacy mode. Changes will NOT be applied to NATS. Enable --control-loop mode to use ObjectStore resources.", os.Namespace, os.Name)
+					opt.Recorder.Event(os, k8sapi.EventTypeWarning, "NotSupported", "ObjectStore resources require --control-loop mode. Updates will NOT be applied.")
+				}
+			},
+		},
+	)
 
 	cacheDir, err := os.MkdirTemp(".", "nack")
 	if err != nil {
 		panic(err)
 	}
+	defer os.RemoveAll(cacheDir)
 
 	return &Controller{
 		ctx:  opt.Ctx,
@@ -168,17 +221,27 @@ func NewController(opt Options) *Controller {
 		cnsQueue:  consumerQueue,
 
 		accLister: accountInformer.Lister(),
-		cacheDir:  cacheDir,
+
+		kvLister: keyValueInformer.Lister(),
+		kvSynced: keyValueInformer.Informer().HasSynced,
+
+		osLister: objectStoreInformer.Lister(),
+		osSynced: objectStoreInformer.Informer().HasSynced,
+
+		cacheDir: cacheDir,
 	}
 }
 
 func (c *Controller) Run() error {
+	// Connect to NATS.
+	opts := make([]nats.Option, 0)
+	// Always attempt to have a connection to NATS.
+	opts = append(opts, nats.MaxReconnects(-1))
+	if c.opts.NATSTLSFirst {
+		opts = append(opts, nats.TLSHandshakeFirst())
+	}
+	natsCtxDefaults := &natsContextDefaults{Name: c.opts.NATSClientName}
 	if !c.opts.CRDConnect {
-		// Connect to NATS.
-		opts := make([]nats.Option, 0)
-
-		opts = append(opts, nats.Name(c.opts.NATSClientName))
-
 		// Use JWT/NKEYS based credentials if present.
 		if c.opts.NATSCredentials != "" {
 			opts = append(opts, nats.UserCredentials(c.opts.NATSCredentials))
@@ -191,26 +254,23 @@ func (c *Controller) Run() error {
 		}
 
 		if c.opts.NATSCertificate != "" && c.opts.NATSKey != "" {
-			opts = append(opts, nats.ClientCert(c.opts.NATSCertificate, c.opts.NATSKey))
+			natsCtxDefaults.TLSCert = c.opts.NATSCertificate
+			natsCtxDefaults.TLSKey = c.opts.NATSKey
 		}
 
 		if c.opts.NATSCA != "" {
-			opts = append(opts, nats.RootCAs(c.opts.NATSCA))
+			natsCtxDefaults.TLSCAs = []string{c.opts.NATSCA}
 		}
-
-		// Always attempt to have a connection to NATS.
-		opts = append(opts, nats.MaxReconnects(-1))
-
-		nc, err := nats.Connect(c.opts.NATSServerURL, opts...)
+		natsCtxDefaults.URL = c.opts.NATSServerURL
+		ncp := newNatsConnPool(logrus.New(), natsCtxDefaults, opts)
+		pooledNc, err := ncp.Get(&natsContext{})
 		if err != nil {
 			return fmt.Errorf("failed to connect to nats: %w", err)
 		}
-		c.nc = nc
-		jm, err := jsm.New(c.nc)
-		if err != nil {
-			return err
-		}
-		c.jm = jm
+		pooledNc.ReturnToPool()
+		c.connPool = ncp
+	} else {
+		c.connPool = newNatsConnPool(logrus.New(), natsCtxDefaults, opts)
 	}
 
 	defer utilruntime.HandleCrash()
@@ -226,6 +286,13 @@ func (c *Controller) Run() error {
 	if !cache.WaitForCacheSync(c.ctx.Done(), c.cnsSynced) {
 		return fmt.Errorf("failed to wait for consumer cache sync")
 	}
+	// Also wait for KeyValue and ObjectStore caches to sync so we can emit warnings
+	if !cache.WaitForCacheSync(c.ctx.Done(), c.kvSynced) {
+		return fmt.Errorf("failed to wait for keyvalue cache sync")
+	}
+	if !cache.WaitForCacheSync(c.ctx.Done(), c.osSynced) {
+		return fmt.Errorf("failed to wait for objectstore cache sync")
+	}
 
 	go wait.Until(c.runStreamQueue, time.Second, c.ctx.Done())
 	go wait.Until(c.runConsumerQueue, time.Second, c.ctx.Done())
@@ -238,7 +305,26 @@ func (c *Controller) Run() error {
 	return nil
 }
 
-func deletedStreams(prev, cur map[string]*apis.Stream) []*apis.Stream {
+// RealJSMC creates a new JSM client from pooled nats connections
+// Providing a blank string for servers, defaults to c.opts.NATSServerUrls
+// call deferred jsmC.Close() on returned instance to return the nats connection to pool
+func (c *Controller) RealJSMC(cfg *natsContext) (jsmClient, error) {
+	if cfg == nil {
+		cfg = &natsContext{}
+	}
+	pooledNc, err := c.connPool.Get(cfg)
+	if err != nil {
+		return nil, err
+	}
+	jm, err := jsm.New(pooledNc.nc)
+	if err != nil {
+		return nil, err
+	}
+	jsmc := &realJsmClient{pooledNc: pooledNc, jm: jm}
+	return jsmc, nil
+}
+
+func selectMissingStreamsFromList(prev, cur map[string]*apis.Stream) []*apis.Stream {
 	var deleted []*apis.Stream
 	for name, ps := range prev {
 		if _, ok := cur[name]; !ok {
@@ -248,7 +334,7 @@ func deletedStreams(prev, cur map[string]*apis.Stream) []*apis.Stream {
 	return deleted
 }
 
-func streamMap(ss []*apis.Stream) map[string]*apis.Stream {
+func streamsMap(ss []*apis.Stream) map[string]*apis.Stream {
 	m := make(map[string]*apis.Stream)
 	for _, s := range ss {
 		m[fmt.Sprintf("%s/%s", s.Namespace, s.Name)] = s
@@ -257,9 +343,13 @@ func streamMap(ss []*apis.Stream) map[string]*apis.Stream {
 }
 
 func (c *Controller) cleanupStreams() error {
+	if c.opts.ReadOnly {
+		return nil
+	}
 	tick := time.NewTicker(c.opts.CleanupPeriod)
 	defer tick.Stop()
 
+	// Track the Stream CRDs that may have been created.
 	var prevStreams map[string]*apis.Stream
 	for {
 		select {
@@ -271,23 +361,40 @@ func (c *Controller) cleanupStreams() error {
 				klog.Infof("failed to list streams for cleanup: %s", err)
 				continue
 			}
-			sm := streamMap(streams)
-
-			for _, s := range deletedStreams(prevStreams, sm) {
-				t := k8smeta.NewTime(time.Now())
-				s.DeletionTimestamp = &t
-				if err := c.processStreamObject(s, &realJsmClient{jm: c.jm}); err != nil {
-					klog.Infof("failed to delete stream %s/%s: %s", s.Namespace, s.Name, err)
-					continue
+			sm := streamsMap(streams)
+			missing := selectMissingStreamsFromList(prevStreams, sm)
+			for _, s := range missing {
+				// A stream that we were tracking but that for some reason
+				// was not part of the latest list shared by informer.
+				// Need to double check whether the stream is present before
+				// considering deletion.
+				klog.Infof("stream %s/%s might be missing, looking it up...", s.Namespace, s.Name)
+				ctx, done := context.WithTimeout(context.Background(), 10*time.Second)
+				defer done()
+				_, err := c.ji.Streams(s.Namespace).Get(ctx, s.Name, k8smeta.GetOptions{})
+				if err != nil {
+					if k8serrors.IsNotFound(err) {
+						klog.Infof("stream %s/%s was not found anymore, deleting from JetStream", s.Namespace, s.Name)
+						t := k8smeta.NewTime(time.Now())
+						s.DeletionTimestamp = &t
+						if err := c.processStreamObject(s, c.RealJSMC); err != nil && !k8serrors.IsNotFound(err) {
+							klog.Infof("failed to delete stream %s/%s: %s", s.Namespace, s.Name, err)
+							continue
+						}
+						klog.Infof("deleted stream %s/%s from JetStream", s.Namespace, s.Name)
+					} else {
+						klog.Warningf("error looking up stream %s/%s", s.Namespace, s.Name)
+					}
+				} else {
+					klog.Infof("found stream %s/%s, no further action needed", s.Namespace, s.Name)
 				}
-				klog.Infof("deleted stream %s/%s", s.Namespace, s.Name)
 			}
 			prevStreams = sm
 		}
 	}
 }
 
-func deletedConsumers(prev, cur map[string]*apis.Consumer) []*apis.Consumer {
+func selectMissingConsumersFromList(prev, cur map[string]*apis.Consumer) []*apis.Consumer {
 	var deleted []*apis.Consumer
 	for name, ps := range prev {
 		if _, ok := cur[name]; !ok {
@@ -306,9 +413,13 @@ func consumerMap(cs []*apis.Consumer) map[string]*apis.Consumer {
 }
 
 func (c *Controller) cleanupConsumers() error {
+	if c.opts.ReadOnly {
+		return nil
+	}
 	tick := time.NewTicker(c.opts.CleanupPeriod)
 	defer tick.Stop()
 
+	// Track consumers that may have been deleted.
 	var prevConsumers map[string]*apis.Consumer
 	for {
 		select {
@@ -321,15 +432,32 @@ func (c *Controller) cleanupConsumers() error {
 				continue
 			}
 			cm := consumerMap(consumers)
-
-			for _, cns := range deletedConsumers(prevConsumers, cm) {
-				t := k8smeta.NewTime(time.Now())
-				cns.DeletionTimestamp = &t
-				if err := c.processConsumerObject(cns, &realJsmClient{jm: c.jm}); err != nil {
-					klog.Infof("failed to delete consumer %s/%s: %s", cns.Namespace, cns.Name, err)
-					continue
+			missing := selectMissingConsumersFromList(prevConsumers, cm)
+			for _, cns := range missing {
+				// A consumer that we were tracking but that for some reason
+				// was not part of the latest list shared by informer.
+				// Need to double check whether the consumer is present before
+				// considering deletion.
+				klog.Infof("consumer %s/%s might be missing, looking it up...", cns.Namespace, cns.Name)
+				ctx, done := context.WithTimeout(context.Background(), 10*time.Second)
+				defer done()
+				_, err := c.ji.Consumers(cns.Namespace).Get(ctx, cns.Name, k8smeta.GetOptions{})
+				if err != nil {
+					if k8serrors.IsNotFound(err) {
+						klog.Infof("consumer %s/%s was not found anymore, deleting from JetStream", cns.Namespace, cns.Name)
+						t := k8smeta.NewTime(time.Now())
+						cns.DeletionTimestamp = &t
+						if err := c.processConsumerObject(cns, c.RealJSMC); err != nil && !k8serrors.IsNotFound(err) {
+							klog.Infof("failed to delete consumer %s/%s: %s", cns.Namespace, cns.Name, err)
+							continue
+						}
+						klog.Infof("deleted consumer %s/%s from JetStream", cns.Namespace, cns.Name)
+					} else {
+						klog.Warningf("error looking up consumer %s/%s", cns.Namespace, cns.Name)
+					}
+				} else {
+					klog.Infof("found consumer %s/%s, no further action needed", cns.Namespace, cns.Name)
 				}
-				klog.Infof("deleted consumer %s/%s", cns.Namespace, cns.Name)
 			}
 			prevConsumers = cm
 		}
@@ -346,6 +474,218 @@ func (c *Controller) warningEvent(o runtime.Object, reason, message string) {
 	if c.rec != nil {
 		c.rec.Event(o, k8sapi.EventTypeWarning, reason, message)
 	}
+}
+
+type accountOverrides struct {
+	remoteClientCert string
+	remoteClientKey  string
+	remoteRootCA     string
+	servers          []string
+	userCreds        string
+	nkey             string
+	user             string
+	password         string
+	token            string
+}
+
+func (c *Controller) getAccountOverrides(account string, ns string) (*accountOverrides, error) {
+	overrides := &accountOverrides{}
+
+	if account == "" || !c.opts.CRDConnect {
+		return overrides, nil
+	}
+
+	// Lookup the account using the REST client.
+	ctx, done := context.WithTimeout(context.Background(), 5*time.Second)
+	defer done()
+	acc, err := c.ji.Accounts(ns).Get(ctx, account, k8smeta.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	overrides.servers = acc.Spec.Servers
+
+	// Lookup the TLS secrets
+	if acc.Spec.TLS != nil && acc.Spec.TLS.Secret != nil {
+		secretName := acc.Spec.TLS.Secret.Name
+		secret, err := c.ki.Secrets(ns).Get(c.ctx, secretName, k8smeta.GetOptions{})
+		if err != nil {
+			return nil, err
+		}
+
+		// Write this to the cacheDir.
+		accDir := filepath.Join(c.cacheDir, ns, account)
+		if err := os.MkdirAll(accDir, 0o755); err != nil {
+			return nil, err
+		}
+
+		var certData, keyData []byte
+		var certPath, keyPath string
+
+		for k, v := range secret.Data {
+			switch k {
+			case acc.Spec.TLS.ClientCert:
+				certPath = filepath.Join(accDir, k)
+				certData = v
+			case acc.Spec.TLS.ClientKey:
+				keyPath = filepath.Join(accDir, k)
+				keyData = v
+			case acc.Spec.TLS.RootCAs:
+				overrides.remoteRootCA = filepath.Join(accDir, k)
+				if err := os.WriteFile(overrides.remoteRootCA, v, 0o644); err != nil {
+					return nil, err
+				}
+			}
+		}
+
+		if certData != nil && keyData != nil {
+			overrides.remoteClientCert = certPath
+			overrides.remoteClientKey = keyPath
+
+			if err := os.WriteFile(certPath, certData, 0o644); err != nil {
+				return nil, err
+			}
+			if err := os.WriteFile(keyPath, keyData, 0o644); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	// Lookup the UserCredentials.
+	if acc.Spec.Creds != nil && acc.Spec.Creds.Secret != nil {
+		secretName := acc.Spec.Creds.Secret.Name
+		secret, err := c.ki.Secrets(ns).Get(c.ctx, secretName, k8smeta.GetOptions{})
+		if err != nil {
+			return nil, err
+		}
+
+		// Write the user credentials to the cache dir.
+		accDir := filepath.Join(c.cacheDir, ns, account)
+		if err := os.MkdirAll(accDir, 0o755); err != nil {
+			return nil, err
+		}
+
+		if credsBytes, ok := secret.Data[acc.Spec.Creds.File]; ok {
+			overrides.userCreds = filepath.Join(accDir, acc.Spec.Creds.File)
+			if err := os.WriteFile(overrides.userCreds, credsBytes, 0o644); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	// Lookup the NKey seed.
+	if acc.Spec.NKey != nil && acc.Spec.NKey.Secret != nil {
+		secretName := acc.Spec.NKey.Secret.Name
+		secret, err := c.ki.Secrets(ns).Get(c.ctx, secretName, k8smeta.GetOptions{})
+		if err != nil {
+			return nil, err
+		}
+
+		if nkeyBytes, ok := secret.Data[acc.Spec.NKey.Seed]; ok {
+			overrides.nkey = string(nkeyBytes)
+		}
+	}
+
+	// Lookup the Token.
+	if acc.Spec.Token != nil {
+		secretName := acc.Spec.Token.Secret.Name
+		secret, err := c.ki.Secrets(ns).Get(c.ctx, secretName, k8smeta.GetOptions{})
+		if err != nil {
+			return nil, err
+		}
+
+		if token, ok := secret.Data[acc.Spec.Token.Token]; ok {
+			overrides.token = string(token)
+		}
+	}
+
+	// Lookup the User.
+	if acc.Spec.User != nil {
+		secretName := acc.Spec.User.Secret.Name
+		secret, err := c.ki.Secrets(ns).Get(c.ctx, secretName, k8smeta.GetOptions{})
+		if err != nil {
+			return nil, err
+		}
+
+		userBytes := secret.Data[acc.Spec.User.User]
+		passwordBytes := secret.Data[acc.Spec.User.Password]
+		if userBytes != nil && passwordBytes != nil {
+			overrides.user = string(userBytes)
+			overrides.password = string(passwordBytes)
+		}
+	}
+
+	return overrides, nil
+}
+
+type jsmcSpecOverrides struct {
+	servers []string
+	tls     *apis.TLS
+	creds   string
+	nkey    string
+}
+
+func (c *Controller) runWithJsmc(jsm jsmClientFunc, acc *accountOverrides, spec *jsmcSpecOverrides, o runtime.Object, op func(jsmClient) error) error {
+	if !c.opts.CRDConnect {
+		jsmc, err := jsm(&natsContext{})
+		if err != nil {
+			return err
+		}
+
+		return op(jsmc)
+	}
+
+	// Create a new client
+	natsCtx := &natsContext{}
+	// Use JWT/NKEYS/user-password/token based credentials if present.
+	if spec.creds != "" {
+		natsCtx.Credentials = spec.creds
+	} else if spec.nkey != "" {
+		natsCtx.Nkey = spec.nkey
+	}
+	if spec.tls != nil {
+		if spec.tls.ClientCert != "" && spec.tls.ClientKey != "" {
+			natsCtx.TLSCert = spec.tls.ClientCert
+			natsCtx.TLSKey = spec.tls.ClientKey
+		}
+	}
+
+	// Use fetched secrets for the account and server if defined.
+	if acc.remoteClientCert != "" && acc.remoteClientKey != "" {
+		natsCtx.TLSCert = acc.remoteClientCert
+		natsCtx.TLSKey = acc.remoteClientKey
+	}
+	if acc.remoteRootCA != "" {
+		natsCtx.TLSCAs = []string{acc.remoteRootCA}
+	}
+	if acc.userCreds != "" {
+		natsCtx.Credentials = acc.userCreds
+	} else if acc.nkey != "" {
+		natsCtx.Nkey = acc.nkey
+	}
+
+	if acc.user != "" && acc.password != "" {
+		natsCtx.Username = acc.user
+		natsCtx.Password = acc.password
+	} else if acc.token != "" {
+		natsCtx.Token = acc.token
+	}
+
+	if spec.tls != nil && len(spec.tls.RootCAs) > 0 {
+		natsCtx.TLSCAs = spec.tls.RootCAs
+	}
+
+	natsServers := strings.Join(append(spec.servers, acc.servers...), ",")
+	natsCtx.URL = natsServers
+	c.normalEvent(o, "Connecting", "Connecting to new nats-servers")
+	jsmc, err := jsm(natsCtx)
+	if err != nil {
+		return fmt.Errorf("failed to connect to nats-servers(%s): %w", natsServers, err)
+	}
+
+	defer jsmc.Close()
+
+	return op(jsmc)
 }
 
 func splitNamespaceName(item interface{}) (ns string, name string, err error) {
@@ -379,7 +719,7 @@ func getStorageType(s string) (jsmapi.StorageType, error) {
 	}
 }
 
-func enqueueWork(q workqueue.RateLimitingInterface, item interface{}) (err error) {
+func enqueueWork(q workqueue.TypedRateLimitingInterface[any], item interface{}) (err error) {
 	key, err := cache.MetaNamespaceKeyFunc(item)
 	if err != nil {
 		return fmt.Errorf("failed to enqueue work: %w", err)
@@ -389,9 +729,12 @@ func enqueueWork(q workqueue.RateLimitingInterface, item interface{}) (err error
 	return nil
 }
 
-type processorFunc func(ns, name string, c jsmClient) error
+type (
+	jsmClientFunc func(*natsContext) (jsmClient, error)
+	processorFunc func(ns, name string, jmsClient jsmClientFunc) error
+)
 
-func processQueueNext(q workqueue.RateLimitingInterface, c jsmClient, process processorFunc) {
+func processQueueNext(q workqueue.TypedRateLimitingInterface[any], jmsClient jsmClientFunc, process processorFunc) {
 	item, shutdown := q.Get()
 	if shutdown {
 		return
@@ -406,7 +749,7 @@ func processQueueNext(q workqueue.RateLimitingInterface, c jsmClient, process pr
 		return
 	}
 
-	err = process(ns, name, c)
+	err = process(ns, name, jmsClient)
 	if err == nil {
 		// Item processed successfully, don't requeue.
 		q.Forget(item)
@@ -426,7 +769,7 @@ func processQueueNext(q workqueue.RateLimitingInterface, c jsmClient, process pr
 	q.Forget(item)
 }
 
-func upsertCondition(cs []apis.Condition, next apis.Condition) []apis.Condition {
+func UpsertCondition(cs []apis.Condition, next apis.Condition) []apis.Condition {
 	for i := 0; i < len(cs); i++ {
 		if cs[i].Type != next.Type {
 			continue
@@ -461,7 +804,7 @@ func shouldEnqueue(prevObj, nextObj interface{}) bool {
 	return markedDelete || specChanged
 }
 
-func eventHandlers(ctx context.Context, q workqueue.RateLimitingInterface) cache.ResourceEventHandlerFuncs {
+func eventHandlers(q workqueue.TypedRateLimitingInterface[any]) cache.ResourceEventHandlerFuncs {
 	return cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			if err := enqueueWork(q, obj); err != nil {

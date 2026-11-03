@@ -22,22 +22,59 @@ type Condition struct {
 	LastTransitionTime string                 `json:"lastTransitionTime"`
 }
 
+type BaseStreamConfig struct {
+	PreventDelete bool `json:"preventDelete"`
+	PreventUpdate bool `json:"preventUpdate"`
+	ConnectionOpts
+}
+
+type ConnectionOpts struct {
+	Account  string   `json:"account,omitempty"`
+	Creds    string   `json:"creds,omitempty"`
+	Nkey     string   `json:"nkey,omitempty"`
+	Servers  []string `json:"servers,omitempty"`
+	TLS      *TLS     `json:"tls,omitempty"`
+	TLSFirst bool     `json:"tlsFirst,omitempty"`
+	JsDomain string   `json:"jsDomain,omitempty"`
+}
+
+type ConsumerLimits struct {
+	InactiveThreshold string `json:"inactiveThreshold,omitempty"`
+	MaxAckPending     int    `json:"maxAckPending,omitempty"`
+}
+
 type TLS struct {
 	ClientCert string   `json:"clientCert"`
 	ClientKey  string   `json:"clientKey"`
-	RootCAs    []string `json:"rootCas"`
+	RootCAs    []string `json:"rootCas,omitempty"`
 }
 
 type TLSSecret struct {
-	ClientCert string     `json:"cert"`
-	ClientKey  string     `json:"key"`
-	RootCAs    string     `json:"ca"`
+	ClientCert string     `json:"cert,omitempty"`
+	ClientKey  string     `json:"key,omitempty"`
+	RootCAs    string     `json:"ca,omitempty"`
 	Secret     *SecretRef `json:"secret"`
 }
 
 type CredsSecret struct {
-	File   string    `json:"file"`
+	File   string     `json:"file,omitempty"`
+	Secret *SecretRef `json:"secret"`
+}
+
+type NKeySecret struct {
+	Seed   string     `json:"seed,omitempty"`
+	Secret *SecretRef `json:"secret"`
+}
+
+type TokenSecret struct {
+	Token  string    `json:"token,omitempty"`
 	Secret SecretRef `json:"secret"`
+}
+
+type User struct {
+	User     string    `json:"user,omitempty"`
+	Password string    `json:"password,omitempty"`
+	Secret   SecretRef `json:"secret"`
 }
 
 type SecretRef struct {

@@ -53,9 +53,17 @@ func TestProcessStream(t *testing.T) {
 				Generation: 1,
 			},
 			Spec: apis.StreamSpec{
-				Name:    name,
-				MaxAge:  "1h",
-				Storage: "memory",
+				Name:         name,
+				MaxAge:       "1h",
+				Storage:      "memory",
+				AllowBatched: true,
+				Sources: []*apis.StreamSource{{
+					Name: "upstream",
+					Consumer: &apis.StreamSourceConsumer{
+						Name:           "src-consumer",
+						DeliverSubject: "deliver.src",
+					},
+				}},
 			},
 		})
 		if err != nil {
@@ -65,11 +73,23 @@ func TestProcessStream(t *testing.T) {
 		jc.PrependReactor("update", "streams", updateObject)
 
 		notFoundErr := jsmapi.ApiError{Code: 404}
+		var capturedConfig jsmapi.StreamConfig
 		jsmc := &mockJsmClient{
-			loadStreamErr: notFoundErr,
+			loadStreamErr:   notFoundErr,
+			newStreamConfig: &capturedConfig,
 		}
-		if err := ctrl.processStream(ns, name, jsmc); err != nil {
+		if err := ctrl.processStream(ns, name, testWrapJSMC(jsmc)); err != nil {
 			t.Fatal(err)
+		}
+
+		if !capturedConfig.AllowBatchPublish {
+			t.Errorf("AllowBatchPublish not set in stream config during create: got=%v, want=true", capturedConfig.AllowBatchPublish)
+		}
+
+		if len(capturedConfig.Sources) != 1 || capturedConfig.Sources[0].Consumer == nil ||
+			capturedConfig.Sources[0].Consumer.Name != "src-consumer" ||
+			capturedConfig.Sources[0].Consumer.DeliverSubject != "deliver.src" {
+			t.Errorf("StreamSource.Consumer not propagated to stream config during create: %+v", capturedConfig.Sources)
 		}
 
 		if got := len(rec.Events); got != wantEvents {
@@ -111,9 +131,18 @@ func TestProcessStream(t *testing.T) {
 				Generation: 2,
 			},
 			Spec: apis.StreamSpec{
-				Name:    name,
-				MaxAge:  "1h",
-				Storage: "memory",
+				Name:              name,
+				MaxAge:            "1h",
+				Storage:           "memory",
+				AllowMsgSchedules: true,
+				AllowBatched:      true,
+				Sources: []*apis.StreamSource{{
+					Name: "upstream",
+					Consumer: &apis.StreamSourceConsumer{
+						Name:           "src-consumer",
+						DeliverSubject: "deliver.src",
+					},
+				}},
 			},
 			Status: apis.Status{
 				ObservedGeneration: 1,
@@ -125,12 +154,31 @@ func TestProcessStream(t *testing.T) {
 
 		jc.PrependReactor("update", "streams", updateObject)
 
+		// Capture the config that gets passed to UpdateConfiguration
+		var capturedConfig jsmapi.StreamConfig
 		jsmc := &mockJsmClient{
 			loadStreamErr: nil,
-			loadStream:    &mockStream{},
+			loadStream: &mockStream{
+				capturedConfig: &capturedConfig,
+			},
 		}
-		if err := ctrl.processStream(ns, name, jsmc); err != nil {
+		if err := ctrl.processStream(ns, name, testWrapJSMC(jsmc)); err != nil {
 			t.Fatal(err)
+		}
+
+		// Verify that AllowMsgSchedules was set in the config
+		if !capturedConfig.AllowMsgSchedules {
+			t.Errorf("AllowMsgSchedules not set in stream config during update: got=%v, want=true", capturedConfig.AllowMsgSchedules)
+		}
+
+		if !capturedConfig.AllowBatchPublish {
+			t.Errorf("AllowBatchPublish not set in stream config during update: got=%v, want=true", capturedConfig.AllowBatchPublish)
+		}
+
+		if len(capturedConfig.Sources) != 1 || capturedConfig.Sources[0].Consumer == nil ||
+			capturedConfig.Sources[0].Consumer.Name != "src-consumer" ||
+			capturedConfig.Sources[0].Consumer.DeliverSubject != "deliver.src" {
+			t.Errorf("StreamSource.Consumer not propagated to stream config: %+v", capturedConfig.Sources)
 		}
 
 		if got := len(rec.Events); got != wantEvents {
@@ -190,7 +238,7 @@ func TestProcessStream(t *testing.T) {
 			loadStreamErr: nil,
 			loadStream:    &mockStream{},
 		}
-		if err := ctrl.processStream(ns, name, jsmc); err != nil {
+		if err := ctrl.processStream(ns, name, testWrapJSMC(jsmc)); err != nil {
 			t.Fatal(err)
 		}
 
@@ -268,7 +316,7 @@ func TestProcessStream(t *testing.T) {
 		jsmc := &mockJsmClient{
 			loadStreamErr: errors.New("failed to load stream"),
 		}
-		if err := ctrl.processStream(ns, name, jsmc); err == nil {
+		if err := ctrl.processStream(ns, name, testWrapJSMC(jsmc)); err == nil {
 			t.Fatal("unexpected success")
 		}
 	})

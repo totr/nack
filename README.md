@@ -1,36 +1,179 @@
 <img width="800" alt="nack-large" src="https://user-images.githubusercontent.com/26195/92535603-71ad9a80-f1ec-11ea-8959-cdc22b31b84a.png">
 
-[![License][License-Image]][License-Url]
-[![Version](https://d25lcipzij17d.cloudfront.net/badge.svg?id=go&type=5&v=0.6.0)](https://github.com/nats-io/nack/releases/tag/v0.6.0)
-
-[License-Url]: https://www.apache.org/licenses/LICENSE-2.0
-[License-Image]: https://img.shields.io/badge/License-Apache2-blue.svg
+[![License Apache 2](https://img.shields.io/badge/License-Apache2-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
+[![Release Badge](https://github.com/nats-io/nack/actions/workflows/release.yaml/badge.svg)](https://github.com/nats-io/nack/actions/workflows/release.yaml)
+[![E2E Badge](https://github.com/nats-io/nack/actions/workflows/e2e.yaml/badge.svg)](https://github.com/nats-io/nack/actions/workflows/e2e.yaml)
+[![TEST Badge](https://github.com/nats-io/nack/actions/workflows/test.yaml/badge.svg)](https://github.com/nats-io/nack/actions/workflows/test.yaml)
 
 [NATS](https://nats.io) Controllers for Kubernetes (NACK)
 
+## Table of Contents
+
+- [JetStream Controller](#jetstream-controller)
+  - [Controller Modes](#controller-modes)
+  - [Getting Started](#getting-started)
+  - [Managing Multiple NATS Systems and Accounts](#managing-multiple-nats-systems-and-accounts)
+  - [Creating NATS Resources](#creating-nats-resources)
+  - [Getting Started with Accounts](#getting-started-with-accounts)
+  - [Local Development](#local-development)
+- [NATS Server Config Reloader](#nats-server-config-reloader)
+- [NATS Boot Config](#nats-boot-config)
+
 ## JetStream Controller
 
-The JetStream controllers allows you to manage [NATS JetStream](https://github.com/nats-io/jetstream) [Streams](https://github.com/nats-io/jetstream#streams-1) and [Consumers](https://github.com/nats-io/jetstream#consumers-1) via K8S CRDs.
+The JetStream controllers allows you to manage [NATS JetStream](https://docs.nats.io/nats-concepts/jetstream) resources via Kubernetes CRDs.
+
+### Controller Modes
+
+NACK supports two controller modes with different capabilities:
+
+| Mode | Streams | Consumers | Key/Value | Object Store | Accounts |
+|------|---------|-----------|-----------|--------------|----------|
+| **Legacy (default)** | ✅ | ✅ | ❌ | ❌ | ❌ |
+| **Control-loop** (`--control-loop`) | ✅ | ✅ | ✅ | ✅ | ✅ |
+
+> **Important**: Key/Value stores and Object stores are **only supported in control-loop mode**. If you create KeyValue or ObjectStore resources without enabling control-loop mode, they will not be reconciled.
+
+Resources managed by NACK controllers are expected to _exclusively_ be managed by NACK, and configuration state will be enforced if mutated by an external client.
+
+## [API Reference](docs/api.md)
+
+The API reference documents all available CRD fields for Streams, Consumers, KeyValue, ObjectStore, and Account resources.
 
 ### Getting started
 
-First install the JetStream CRDs:
+Install with Helm:
 
 ```sh
-$ kubectl apply -f https://raw.githubusercontent.com/nats-io/nack/v0.6.0/deploy/crds.yml
-```
-
-Now install with Helm:
-
-```
 helm repo add nats https://nats-io.github.io/k8s/helm/charts/
-helm install nats nats/nats --set=nats.jetstream.enabled=true
-helm install nack nats/nack --set jetstream.nats.url=nats://nats:4222
+helm repo update
+
+helm upgrade --install nats nats/nats \
+  --set config.jetstream.enabled=true \
+  --set config.jetstream.memoryStore.enabled=true \
+  --set config.cluster.enabled=true --wait
+
+helm upgrade --install nack nats/nack \
+  --set jetstream.nats.url=nats://nats.default.svc.cluster.local:4222 --wait
 ```
 
-#### Creating Streams and Consumers
+#### (Optional) Enable Experimental `controller-runtime` Controllers
 
-Let's create a a stream and a couple of consumers:
+> **Note**: The updated controllers will more reliably enforce resource state. If migrating from an older version of NACK, as long as all NATS resources are in-sync with NACK resources no modifications are expected.
+>
+> The `jetstream-controller` logs will contain a diff of any changes the controller has made.
+
+```sh
+helm upgrade nack nats/nack \
+  --set jetstream.nats.url=nats://nats.default.svc.cluster.local:4222 \
+  --set jetstream.additionalArgs={--control-loop} --wait
+```
+
+### Managing Multiple NATS Systems and Accounts
+
+There are several approaches for managing multiple NATS Systems with NACK within one Kubernetes cluster. These options are not mutually exclusive.
+
+#### 1. Run Multiple Namespaced Controllers
+You can run multiple NACK controllers on the same Kubernetes cluster. Add `--set config.namespaced=true` to your install flags or set `namespaced: true` in your `values.yaml`. When set, the controller will only reconcile resources within its own namespace.
+
+```sh
+helm upgrade --install nack nats/nack \
+  --create-namespace --namespace nats \
+  --set namespaced=true \
+  --set jetstream.nats.url=nats://nats.nats.svc.cluster.local:4222 --wait
+```
+
+#### 2. Use the Accounts Resource
+The Accounts resource acts as a connection config for other resources. You may define multiple accounts for the same, or for distinct, NATS Systems.
+
+```yaml
+---
+apiVersion: jetstream.nats.io/v1beta2
+kind: Account
+metadata:
+  name: a
+spec:
+  name: a
+  creds:
+    secret:
+      name: account-a-creds
+  servers:
+    - nats://nats.nats-a.svc.cluster.local
+---
+apiVersion: jetstream.nats.io/v1beta2
+kind: Account
+metadata:
+  name: b
+spec:
+  name: b
+  creds:
+    secret:
+      name: account-b-creds
+  servers:
+    - nats://nats.nats-b.svc.cluster.local
+---
+apiVersion: jetstream.nats.io/v1beta2
+kind: Stream
+metadata:
+  name: foo-a
+spec:
+  name: foo
+  subjects: ["foo", "foo.>"]
+  storage: file
+  replicas: 3
+  maxAge: 1h
+  account: a
+---
+apiVersion: jetstream.nats.io/v1beta2
+kind: Stream
+metadata:
+  name: foo-b
+spec:
+  name: foo
+  subjects: ["foo", "foo.>"]
+  storage: file
+  replicas: 3
+  maxAge: 1h
+  account: b
+```
+
+The above manifests will define two Account resources, each pulling credentials from a Kubernetes secret. Account `a` is configured to use the NATS Cluster in namespace `nats-a` and Account `b` is configured to use the NATS Cluster in namespace `nats-b`. The NATS clusters do not need to be in Kubernetes, this is just an example.
+
+This will also create an identical stream, `foo`, in each cluster. **Note:** The resource names, `foo-a` and `foo-b`, must be distinct to not conflict as Kubernetes resources, but the stream names themselves are both `foo`.
+
+See more details in the [Getting Started with Accounts](#getting-started-with-accounts) section.
+
+#### 3. Define Connection Config in the CRD Manifest
+You may define some connection options within the resource manifests directly. If not running in the newer `--control-loop` mode, set `--crd-connect`.
+
+If running with `--control-loop`, resource-level connection config will always override any global config.
+
+> **Note**: The `--crd-connect` flag is not required if running with `--control-loop`.
+
+```sh
+helm upgrade nack nats/nack \
+  --set jetstream.additionalArgs={--crd-connect} --wait
+```
+
+#### Example Stream:
+```yaml
+apiVersion: jetstream.nats.io/v1beta2
+kind: Stream
+metadata:
+  name: bar
+spec:
+  name: bar
+  subjects: ["bar", "bar.>"]
+  storage: file
+  replicas: 3
+  maxAge: 1h
+  servers:
+    - nats://nats.nats.svc.cluster.local:4222
+```
+
+### Creating NATS Resources
+
+Let's create a stream and a couple of consumers:
 
 ```yaml
 ---
@@ -67,6 +210,30 @@ spec:
   filterSubject: orders.received
   maxDeliver: 20
   ackPolicy: explicit
+---
+# Note: KeyValue requires control-loop mode to be enabled
+apiVersion: jetstream.nats.io/v1beta2
+kind: KeyValue
+metadata:
+  name: my-key-value
+spec:
+  bucket: my-key-value
+  history: 20
+  storage: file
+  maxBytes: 2048
+  compression: true
+---
+# Note: ObjectStore requires control-loop mode to be enabled
+apiVersion: jetstream.nats.io/v1beta2
+kind: ObjectStore
+metadata:
+  name: my-object-store
+spec:
+  bucket: my-object-store
+  storage: file
+  replicas: 1
+  maxBytes: 536870912 # 512 MB
+  compression: true
 ```
 
 ```sh
@@ -76,7 +243,7 @@ $ kubectl apply -f https://raw.githubusercontent.com/nats-io/nack/main/deploy/ex
 # Check if it was successfully created.
 $ kubectl get streams
 NAME       STATE     STREAM NAME   SUBJECTS
-mystream   Created   mystream      [orders.*]
+mystream   Ready     mystream      [orders.*]
 
 # Create a push-based consumer
 $ kubectl apply -f https://raw.githubusercontent.com/nats-io/nack/main/deploy/examples/consumer_push.yml
@@ -87,8 +254,8 @@ $ kubectl apply -f https://raw.githubusercontent.com/nats-io/nack/main/deploy/ex
 # Check if they were successfully created.
 $ kubectl get consumers
 NAME               STATE     STREAM     CONSUMER           ACK POLICY
-my-pull-consumer   Created   mystream   my-pull-consumer   explicit
-my-push-consumer   Created   mystream   my-push-consumer   none
+my-pull-consumer   Ready     mystream   my-pull-consumer   explicit
+my-push-consumer   Ready     mystream   my-push-consumer   none
 
 # If you end up in an Errored state, run kubectl describe for more info.
 #     kubectl describe streams mystream
@@ -100,13 +267,9 @@ data into `mystream`.
 
 ```sh
 # Run nats-box that includes the NATS management utilities, and exec into it.
-$ kubectl apply -f https://nats-io.github.io/k8s/tools/nats-box.yml
-$ kubectl exec -it nats-box -- /bin/sh -l
+$ kubectl exec -it deployment/nats-box -- /bin/sh -l
 
 # Publish a couple of messages from nats-box
-nats-box:~$ nats context save jetstream -s nats://nats:4222
-nats-box:~$ nats context select jetstream
-
 nats-box:~$ nats pub orders.received "order 1"
 nats-box:~$ nats pub orders.received "order 2"
 ```
@@ -170,6 +333,10 @@ order 2
 You can create an Account resource with the following CRD. The Account resource
 can be used to specify server and TLS information.
 
+> **Note** The `Account` resource does not create or manage NATS accounts. It functions as a connection and authentication config for the managed resources.
+
+The [nsc](https://docs.nats.io/using-nats/nats-tools/nsc/basics#creating-an-operator-account-and-user) tool can be used to manage your NATS account configuration on the server-side. You can find more details about NATS decentralized auth in the [docs](https://docs.nats.io/running-a-nats-service/configuration/securing_nats/auth_intro/jwt).
+
 ```yaml
 ---
 apiVersion: jetstream.nats.io/v1beta2
@@ -179,7 +346,7 @@ metadata:
 spec:
   name: a
   servers:
-  - nats://nats:4222
+    - nats://nats:4222
   tls:
     secret:
       name: nack-a-tls
@@ -210,31 +377,32 @@ Server URL and TLS certificates.
 
 ```sh
 # Install cert-manager
-kubectl apply -f https://github.com/jetstack/cert-manager/releases/download/v1.6.0/cert-manager.yaml
+kubectl apply -f https://github.com/jetstack/cert-manager/releases/download/v1.17.0/cert-manager.yaml
 
 # Install TLS certs
 cd examples/secure
+
 # Install certificate issuer
 kubectl apply -f issuer.yaml
+
 # Install account A cert
 kubectl apply -f nack-a-client-tls.yaml
+
 # Install server cert
 kubectl apply -f server-tls.yaml
+
 # Install nats-box cert
 kubectl apply -f client-tls.yaml
 
 # Install NATS cluster
-helm install -f nats-helm.yaml nats nats/nats
+helm upgrade --install -f nats-helm.yaml nats nats/nats
+
 # Verify pods are healthy
 kubectl get pods
 
-# Install nats-box to run nats cli later
-kubectl apply -f nats-client-box.yaml
-
 # Install JetStream Controller from nack
-helm install --set jetstream.enabled=true jetstream-controller nats/nack
-# Install CRDs
-kubectl apply -f ../../deploy/crds.yml
+helm upgrade --install nack nats/nack --set jetstream.enabled=true
+
 # Verify pods are healthy
 kubectl get pods
 
@@ -243,6 +411,7 @@ kubectl apply -f nack/nats-account-a.yaml
 
 # Create stream using account A
 kubectl apply -f nack/nats-stream-foo-a.yaml
+
 # Create consumer using account A
 kubectl apply -f nack/nats-consumer-bar-a.yaml
 ```
@@ -252,30 +421,28 @@ container to run the management CLI.
 
 ```sh
 # Get container shell
-kubectl exec -it nats-client-box-abc-123 -- sh
-# Change to TLS directory
-cd /etc/nats-certs/clients/nack-a-tls
+kubectl exec -it deployment/nats-box -- /bin/sh -l
 ```
 
 There should now be some Streams available, verify with `nats` command.
 
 ```sh
 # List streams
-nats --tlscert tls.crt --tlskey tls.key --tlsca ca.crt -s tls://nats.default.svc.cluster.local stream ls
+nats stream ls
 ```
 
 You can now publish messages on a Stream.
 
 ```sh
 # Push message
-nats --tlscert tls.crt --tlskey tls.key --tlsca ca.crt -s tls://nats.default.svc.cluster.local pub foo hi
+nats pub foo hi
 ```
 
 And pull messages from a Consumer.
 
 ```sh
 # Pull message
-nats --tlscert tls.crt --tlskey tls.key --tlsca ca.crt -s tls://nats.default.svc.cluster.local consumer next foo bar
+nats consumer next foo bar
 ```
 
 ### Local Development
@@ -299,6 +466,7 @@ nats-server -DV -js
 ```
 
 Build Docker image
+
 ```sh
 make jetstream-controller-docker ver=1.2.3
 ```
@@ -313,9 +481,9 @@ configuration file.
 For more information see the
 [Chart repo](https://github.com/nats-io/k8s/tree/main/helm/charts/nats).
 
-```
+```sh
 helm repo add nats https://nats-io.github.io/k8s/helm/charts/
-helm install my-nats nats/nats
+helm upgrade --install nats nats/nats
 ```
 
 ### Configuring
@@ -323,7 +491,7 @@ helm install my-nats nats/nats
 ```yaml
 reloader:
   enabled: true
-  image: natsio/nats-server-config-reloader:0.6.0
+  image: natsio/nats-server-config-reloader:0.16.1
   pullPolicy: IfNotPresent
 ```
 
@@ -338,27 +506,30 @@ make nats-server-config-reloader
 ```
 
 Build Docker image
+
 ```sh
 make nats-server-config-reloader-docker ver=1.2.3
 ```
 
 ## NATS Boot Config
 
+A helper utility used during NATS server pod initialization to generate and manage boot-time configuration.
+
 ### Installing with Helm
 
 For more information see the
-[Chart repo](https://github.com/nats-io/k8s/tree/master/helm/charts/nats).
+[Chart repo](https://github.com/nats-io/k8s/tree/main/helm/charts/nats).
 
-```
+```sh
 helm repo add nats https://nats-io.github.io/k8s/helm/charts/
-helm install my-nats nats/nats
+helm upgrade --install nats nats/nats
 ```
 
 ### Configuring
 
 ```yaml
 bootconfig:
-  image: natsio/nats-boot-config:0.5.2
+  image: natsio/nats-boot-config:0.16.1
   pullPolicy: IfNotPresent
 ```
 
@@ -373,6 +544,7 @@ make nats-boot-config
 ```
 
 Build Docker image
+
 ```sh
 make nats-boot-config-docker ver=1.2.3
 ```

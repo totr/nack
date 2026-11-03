@@ -1,4 +1,4 @@
-// Copyright 2020-2021 The NATS Authors
+// Copyright 2020-2023 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -20,24 +20,32 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	"github.com/nats-io/nack/controllers/jetstream"
+	"github.com/nats-io/nack/internal/controller"
+	v1beta2 "github.com/nats-io/nack/pkg/jetstream/apis/jetstream/v1beta2"
 	clientset "github.com/nats-io/nack/pkg/jetstream/generated/clientset/versioned"
-
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/kubernetes"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
 	klog "k8s.io/klog/v2"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/healthz"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 var (
 	BuildTime = "build-time-not-set"
 	GitInfo   = "gitinfo-not-set"
-	Version   = "0.6.0"
+	Version   = "not-set"
 )
 
 func main() {
@@ -49,7 +57,15 @@ func main() {
 
 func run() error {
 	klog.InitFlags(nil)
-	kubeConfig := flag.String("kubeconfig", "", "Path to kubeconfig")
+	// Opt into the new klog behavior so that -stderrthreshold is honored even
+	// when -logtostderr=true (the default).
+	// Ref: kubernetes/klog#212, kubernetes/klog#432
+	_ = flag.Set("legacy_stderr_threshold_behavior", "false")
+	_ = flag.Set("stderrthreshold", "INFO")
+
+	// Explicitly register controller-runtime flags
+	ctrl.RegisterFlags(nil)
+
 	namespace := flag.String("namespace", v1.NamespaceAll, "Restrict to a namespace")
 	version := flag.Bool("version", false, "Print the version and exit")
 	creds := flag.String("creds", "", "NATS Credentials")
@@ -57,9 +73,16 @@ func run() error {
 	cert := flag.String("tlscert", "", "NATS TLS public certificate")
 	key := flag.String("tlskey", "", "NATS TLS private key")
 	ca := flag.String("tlsca", "", "NATS TLS certificate authority chain")
+	tlsfirst := flag.Bool("tlsfirst", false, "If enabled, forces explicit TLS without waiting for Server INFO")
 	server := flag.String("s", "", "NATS Server URL")
-	crdConnect := flag.Bool("crd-connect", false, "If true, then NATS connections will be made from CRD config, not global config")
+	crdConnect := flag.Bool("crd-connect", false, "If true, then NATS connections will be made from CRD config, not global config. Ignored if running with control loop, CRD options will always override global config")
 	cleanupPeriod := flag.Duration("cleanup-period", 30*time.Second, "Period to run object cleanup")
+	readOnly := flag.Bool("read-only", false, "Starts the controller without causing changes to the NATS resources")
+	cacheDir := flag.String("cache-dir", "", "Directory to store cached credential and TLS files")
+	controlLoop := flag.Bool("control-loop", false, "Experimental: Run controller with a full reconciliation control loop")
+	controlLoopSyncInterval := flag.Duration("sync-interval", time.Minute, "Interval to perform scheduled reconcile")
+	healthProbeBindAddress := flag.String("health-probe-bind-address", ":8081", "The address the probe endpoint binds to")
+
 	flag.Parse()
 
 	if *version {
@@ -71,18 +94,38 @@ func run() error {
 		return errors.New("NATS Server URL is required")
 	}
 
-	var config *rest.Config
-	var err error
-	if *kubeConfig == "" {
-		config, err = rest.InClusterConfig()
-		if err != nil {
-			return err
+	config, err := ctrl.GetConfig()
+	if err != nil {
+		return fmt.Errorf("get kubernetes rest config: %w", err)
+	}
+
+	if *controlLoop {
+		klog.Warning("Starting JetStream controller in experimental control loop mode")
+
+		natsCfg := &controller.NatsConfig{
+			ClientName:  "jetstream-controller",
+			Credentials: *creds,
+			NKey:        *nkey,
+			ServerURL:   *server,
+			CAs:         []string{},
+			Certificate: *cert,
+			Key:         *key,
+			TLSFirst:    *tlsfirst,
 		}
-	} else {
-		config, err = clientcmd.BuildConfigFromFlags("", *kubeConfig)
-		if err != nil {
-			return err
+
+		if *ca != "" {
+			natsCfg.CAs = []string{*ca}
 		}
+
+		controllerCfg := &controller.Config{
+			ReadOnly:               *readOnly,
+			Namespace:              *namespace,
+			CacheDir:               *cacheDir,
+			RequeueInterval:        *controlLoopSyncInterval,
+			HealthProbeBindAddress: *healthProbeBindAddress,
+		}
+
+		return runControlLoop(config, natsCfg, controllerCfg)
 	}
 
 	// K8S API Client.
@@ -110,16 +153,89 @@ func run() error {
 		NATSCA:          *ca,
 		NATSCertificate: *cert,
 		NATSKey:         *key,
+		NATSTLSFirst:    *tlsfirst,
 		KubeIface:       kc,
 		JetstreamIface:  jc,
 		Namespace:       *namespace,
 		CRDConnect:      *crdConnect,
 		CleanupPeriod:   *cleanupPeriod,
+		ReadOnly:        *readOnly,
 	})
 
 	klog.Infof("Starting %s v%s...", os.Args[0], Version)
+	klog.Infof("Running in LEGACY mode")
+	if *readOnly {
+		klog.Infof("Running in read-only mode: JetStream state in server will not be changed")
+	}
 	go handleSignals(cancel)
 	return ctrl.Run()
+}
+
+func runControlLoop(config *rest.Config, natsCfg *controller.NatsConfig, controllerCfg *controller.Config) error {
+	// Setup scheme
+	scheme := runtime.NewScheme()
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(v1beta2.AddToScheme(scheme))
+
+	log.SetLogger(klog.NewKlogr())
+
+	ctrlOpts := ctrl.Options{
+		Scheme:                 scheme,
+		Logger:                 log.Log,
+		HealthProbeBindAddress: controllerCfg.HealthProbeBindAddress,
+	}
+
+	if controllerCfg.Namespace != "" {
+		ctrlOpts.Cache = cache.Options{
+			DefaultNamespaces: map[string]cache.Config{
+				controllerCfg.Namespace: {},
+			},
+		}
+	}
+
+	mgr, err := ctrl.NewManager(config, ctrlOpts)
+	if err != nil {
+		return fmt.Errorf("unable to start manager: %w", err)
+	}
+
+	if controllerCfg.CacheDir == "" {
+		cacheDir, err := os.MkdirTemp(".", "nack")
+		if err != nil {
+			return fmt.Errorf("create cache dir: %w", err)
+		}
+		defer os.RemoveAll(cacheDir)
+		cacheDir, err = filepath.Abs(cacheDir)
+		if err != nil {
+			return fmt.Errorf("get absolute cache dir: %w", err)
+		}
+		controllerCfg.CacheDir = cacheDir
+	} else {
+		if _, err := os.Stat(controllerCfg.CacheDir); os.IsNotExist(err) {
+			err = os.MkdirAll(controllerCfg.CacheDir, 0o755)
+			if err != nil {
+				return fmt.Errorf("create cache dir: %w", err)
+			}
+		}
+	}
+
+	err = controller.RegisterAll(mgr, natsCfg, controllerCfg)
+	if err != nil {
+		return fmt.Errorf("register jetstream controllers: %w", err)
+	}
+
+	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
+		return fmt.Errorf("unable to set up health check: %w", err)
+	}
+	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
+		return fmt.Errorf("unable to set up ready check: %w", err)
+	}
+
+	klog.Info("starting manager")
+	klog.Infof("Running in CONTROL-LOOP mode")
+	if controllerCfg.ReadOnly {
+		klog.Infof("Running in read-only mode: JetStream state in server will not be changed")
+	}
+	return mgr.Start(ctrl.SetupSignalHandler())
 }
 
 func handleSignals(cancel context.CancelFunc) {

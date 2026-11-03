@@ -1,4 +1,4 @@
-// Copyright 2020 The NATS Authors
+// Copyright 2025 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -22,11 +22,15 @@ import (
 // Interface provides access to all the informers in this group version.
 type Interface interface {
 	// Accounts returns a AccountInformer.
-	Accounts() AccountInformer
+	Accounts() TypedAccountInformer
 	// Consumers returns a ConsumerInformer.
-	Consumers() ConsumerInformer
+	Consumers() TypedConsumerInformer
+	// KeyValues returns a KeyValueInformer.
+	KeyValues() TypedKeyValueInformer
+	// ObjectStores returns a ObjectStoreInformer.
+	ObjectStores() TypedObjectStoreInformer
 	// Streams returns a StreamInformer.
-	Streams() StreamInformer
+	Streams() TypedStreamInformer
 }
 
 type version struct {
@@ -40,17 +44,27 @@ func New(f internalinterfaces.SharedInformerFactory, namespace string, tweakList
 	return &version{factory: f, namespace: namespace, tweakListOptions: tweakListOptions}
 }
 
-// Accounts returns a AccountInformer.
-func (v *version) Accounts() AccountInformer {
+// Accounts returns a TypedAccountInformer.
+func (v *version) Accounts() TypedAccountInformer {
 	return &accountInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }
 
-// Consumers returns a ConsumerInformer.
-func (v *version) Consumers() ConsumerInformer {
+// Consumers returns a TypedConsumerInformer.
+func (v *version) Consumers() TypedConsumerInformer {
 	return &consumerInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }
 
-// Streams returns a StreamInformer.
-func (v *version) Streams() StreamInformer {
+// KeyValues returns a TypedKeyValueInformer.
+func (v *version) KeyValues() TypedKeyValueInformer {
+	return &keyValueInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+}
+
+// ObjectStores returns a TypedObjectStoreInformer.
+func (v *version) ObjectStores() TypedObjectStoreInformer {
+	return &objectStoreInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+}
+
+// Streams returns a TypedStreamInformer.
+func (v *version) Streams() TypedStreamInformer {
 	return &streamInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }

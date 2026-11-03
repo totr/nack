@@ -17,29 +17,26 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
-	"strings"
 	"time"
 
 	jsm "github.com/nats-io/jsm.go"
 	jsmapi "github.com/nats-io/jsm.go/api"
 	apis "github.com/nats-io/nack/pkg/jetstream/apis/jetstream/v1beta2"
 	typed "github.com/nats-io/nack/pkg/jetstream/generated/clientset/versioned/typed/jetstream/v1beta2"
-	"github.com/nats-io/nats.go"
-
 	k8sapi "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	k8smeta "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
+	klog "k8s.io/klog/v2"
 )
 
 func (c *Controller) runStreamQueue() {
 	for {
-		processQueueNext(c.strQueue, &realJsmClient{jm: c.jm}, c.processStream)
+		processQueueNext(c.strQueue, c.RealJSMC, c.processStream)
 	}
 }
 
-func (c *Controller) processStream(ns, name string, jsmc jsmClient) (err error) {
+func (c *Controller) processStream(ns, name string, jsm jsmClientFunc) (err error) {
 	str, err := c.strLister.Streams(ns).Get(name)
 	if err != nil && k8serrors.IsNotFound(err) {
 		return nil
@@ -47,10 +44,10 @@ func (c *Controller) processStream(ns, name string, jsmc jsmClient) (err error) 
 		return err
 	}
 
-	return c.processStreamObject(str, jsmc)
+	return c.processStreamObject(str, jsm)
 }
 
-func (c *Controller) processStreamObject(str *apis.Stream, jsmc jsmClient) (err error) {
+func (c *Controller) processStreamObject(str *apis.Stream, jsm jsmClientFunc) (err error) {
 	defer func() {
 		if err != nil {
 			err = fmt.Errorf("failed to process stream: %w", err)
@@ -60,45 +57,11 @@ func (c *Controller) processStreamObject(str *apis.Stream, jsmc jsmClient) (err 
 	spec := str.Spec
 	ifc := c.ji.Streams(str.Namespace)
 	ns := str.Namespace
+	readOnly := c.opts.ReadOnly
 
-	var (
-		remoteClientCert string
-		remoteClientKey  string
-		remoteRootCA     string
-		accServers       []string
-	)
-	if spec.Account != "" && c.opts.CRDConnect {
-		// Lookup the account.
-		acc, err := c.accLister.Accounts(ns).Get(spec.Account)
-		if err != nil {
-			return err
-		}
-
-		// Lookup the TLS secrets
-		if acc.Spec.TLS != nil && acc.Spec.TLS.Secret != nil {
-			secretName := acc.Spec.TLS.Secret.Name
-			secret, err := c.ki.Secrets(ns).Get(c.ctx, secretName, k8smeta.GetOptions{})
-			if err != nil {
-				return err
-			}
-
-			// Write this to the cacheDir
-			accDir := filepath.Join(c.cacheDir, ns, spec.Account)
-			if err := os.MkdirAll(accDir, 0755); err != nil {
-				return err
-			}
-
-			remoteClientCert = filepath.Join(accDir, acc.Spec.TLS.ClientCert)
-			remoteClientKey = filepath.Join(accDir, acc.Spec.TLS.ClientKey)
-			remoteRootCA = filepath.Join(accDir, acc.Spec.TLS.RootCAs)
-			accServers = acc.Spec.Servers
-
-			for k, v := range secret.Data {
-				if err := os.WriteFile(filepath.Join(accDir, k), v, 0644); err != nil {
-					return err
-				}
-			}
-		}
+	acc, err := c.getAccountOverrides(spec.Account, ns)
+	if err != nil {
+		return err
 	}
 
 	defer func() {
@@ -114,62 +77,14 @@ func (c *Controller) processStreamObject(str *apis.Stream, jsmc jsmClient) (err 
 	type operator func(ctx context.Context, c jsmClient, spec apis.StreamSpec) (err error)
 
 	natsClientUtil := func(op operator) error {
-		servers := spec.Servers
-		if c.opts.CRDConnect {
-			// Create a new client
-			opts := make([]nats.Option, 0)
-			opts = append(opts, nats.Name(fmt.Sprintf("%s-str-%s-%d", c.opts.NATSClientName, spec.Name, str.Generation)))
-			// Use JWT/NKEYS based credentials if present.
-			if spec.Creds != "" {
-				opts = append(opts, nats.UserCredentials(spec.Creds))
-			} else if spec.Nkey != "" {
-				opt, err := nats.NkeyOptionFromSeed(spec.Nkey)
-				if err != nil {
-					return err
-				}
-				opts = append(opts, opt)
-			}
-			if spec.TLS.ClientCert != "" && spec.TLS.ClientKey != "" {
-				opts = append(opts, nats.ClientCert(spec.TLS.ClientCert, spec.TLS.ClientKey))
-			}
-
-			// Use fetched secrets for the account and server if defined.
-			if remoteClientCert != "" && remoteClientKey != "" {
-				opts = append(opts, nats.ClientCert(remoteClientCert, remoteClientKey))
-			}
-			if remoteRootCA != "" {
-				opts = append(opts, nats.RootCAs(remoteRootCA))
-			}
-
-			if len(spec.TLS.RootCAs) > 0 {
-				opts = append(opts, nats.RootCAs(spec.TLS.RootCAs...))
-			}
-
-			opts = append(opts, nats.MaxReconnects(-1))
-
-			natsServers := strings.Join(append(servers, accServers...), ",")
-			newNc, err := nats.Connect(natsServers, opts...)
-			if err != nil {
-				return fmt.Errorf("failed to connect to nats-servers(%s): %w", natsServers, err)
-			}
-
-			c.normalEvent(str, "Connecting", "Connecting to new nats-servers")
-			newJm, err := jsm.New(newNc)
-			if err != nil {
-				return err
-			}
-			newJsmc := &realJsmClient{nc: newNc, jm: newJm}
-
-			if err := op(c.ctx, newJsmc, spec); err != nil {
-				return err
-			}
-			newJsmc.Close()
-		} else {
-			if err := op(c.ctx, jsmc, spec); err != nil {
-				return err
-			}
-		}
-		return nil
+		return c.runWithJsmc(jsm, acc, &jsmcSpecOverrides{
+			servers: spec.Servers,
+			tls:     spec.TLS,
+			creds:   spec.Creds,
+			nkey:    spec.Nkey,
+		}, str, func(jsmc jsmClient) error {
+			return op(c.ctx, jsmc, spec)
+		})
 	}
 
 	deleteOK := str.GetDeletionTimestamp() != nil
@@ -183,10 +98,14 @@ func (c *Controller) processStreamObject(str *apis.Stream, jsmc jsmClient) (err 
 		return err
 	}
 	updateOK := (strOK && !deleteOK && newGeneration)
-	createOK := (!strOK && !deleteOK && newGeneration)
+	createOK := (!strOK && !deleteOK) || (!updateOK && !deleteOK && newGeneration)
 
 	switch {
 	case createOK:
+		if readOnly {
+			c.normalEvent(str, "SkipCreate", fmt.Sprintf("Skip creating stream %q", spec.Name))
+			return nil
+		}
 		c.normalEvent(str, "Creating", fmt.Sprintf("Creating stream %q", spec.Name))
 		if err := natsClientUtil(createStream); err != nil {
 			return err
@@ -197,6 +116,13 @@ func (c *Controller) processStreamObject(str *apis.Stream, jsmc jsmClient) (err 
 		}
 		c.normalEvent(str, "Created", fmt.Sprintf("Created stream %q", spec.Name))
 	case updateOK:
+		if str.Spec.PreventUpdate || readOnly {
+			c.normalEvent(str, "SkipUpdate", fmt.Sprintf("Skip updating stream %q", spec.Name))
+			if _, err := setStreamOK(c.ctx, str, ifc); err != nil {
+				return err
+			}
+			return nil
+		}
 		c.normalEvent(str, "Updating", fmt.Sprintf("Updating stream %q", spec.Name))
 		if err := natsClientUtil(updateStream); err != nil {
 			return err
@@ -208,12 +134,25 @@ func (c *Controller) processStreamObject(str *apis.Stream, jsmc jsmClient) (err 
 		c.normalEvent(str, "Updated", fmt.Sprintf("Updated stream %q", spec.Name))
 		return nil
 	case deleteOK:
+		if str.Spec.PreventDelete || readOnly {
+			c.normalEvent(str, "SkipDelete", fmt.Sprintf("Skip deleting stream %q", spec.Name))
+			if _, err := setStreamOK(c.ctx, str, ifc); err != nil {
+				return err
+			}
+			return nil
+		}
 		c.normalEvent(str, "Deleting", fmt.Sprintf("Deleting stream %q", spec.Name))
 		if err := natsClientUtil(deleteStream); err != nil {
 			return err
 		}
 	default:
-		c.warningEvent(str, "Noop", fmt.Sprintf("Nothing done for stream %q", spec.Name))
+		c.normalEvent(str, "Noop", fmt.Sprintf("Nothing done for stream %q (prevent-delete=%v, prevent-update=%v)",
+			spec.Name, spec.PreventDelete, spec.PreventUpdate,
+		))
+		// Noop events only update the status of the CRD.
+		if _, err := setStreamOK(c.ctx, str, ifc); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -237,7 +176,7 @@ func createStream(ctx context.Context, c jsmClient, spec apis.StreamSpec) (err e
 		}
 	}()
 
-	maxAge, err := getMaxAge(spec.MaxAge)
+	maxAge, err := getDurationFromString(spec.MaxAge)
 	if err != nil {
 		return err
 	}
@@ -279,6 +218,13 @@ func createStream(ctx context.Context, c jsmClient, spec apis.StreamSpec) (err e
 		opts = append(opts, jsm.DiscardOld())
 	case "new":
 		opts = append(opts, jsm.DiscardNew())
+	}
+
+	switch spec.Compression {
+	case "s2":
+		opts = append(opts, jsm.Compression(jsmapi.S2Compression))
+	case "none":
+		opts = append(opts, jsm.Compression(jsmapi.NoCompression))
 	}
 
 	if spec.NoAck {
@@ -334,6 +280,103 @@ func createStream(ctx context.Context, c jsmClient, spec apis.StreamSpec) (err e
 		return nil
 	})
 
+	if spec.RePublish != nil {
+		opts = append(opts, jsm.Republish(&jsmapi.RePublish{
+			Source:      spec.RePublish.Source,
+			Destination: spec.RePublish.Destination,
+		}))
+	}
+
+	if spec.SubjectTransform != nil {
+		opts = append(opts, func(o *jsmapi.StreamConfig) error {
+			o.SubjectTransform = &jsmapi.SubjectTransformConfig{
+				Source:      spec.SubjectTransform.Source,
+				Destination: spec.SubjectTransform.Dest,
+			}
+			return nil
+		})
+	}
+
+	if spec.AllowDirect {
+		opts = append(opts, jsm.AllowDirect())
+	}
+
+	if spec.AllowRollup {
+		opts = append(opts, jsm.AllowRollup())
+	}
+
+	if spec.DenyDelete {
+		opts = append(opts, jsm.DenyDelete())
+	}
+
+	if spec.DenyPurge {
+		opts = append(opts, jsm.DenyPurge())
+	}
+
+	if spec.DiscardPerSubject {
+		opts = append(opts, jsm.DiscardNewPerSubject())
+	}
+
+	if spec.FirstSequence != 0 {
+		opts = append(opts, jsm.FirstSequence(spec.FirstSequence))
+	}
+
+	if spec.Metadata != nil {
+		opts = append(opts, jsm.StreamMetadata(spec.Metadata))
+	}
+
+	if spec.AllowMsgTTL {
+		opts = append(opts, jsm.AllowMsgTTL())
+	}
+
+	if spec.SubjectDeleteMarkerTTL != "" {
+		d, err := time.ParseDuration(spec.SubjectDeleteMarkerTTL)
+		if err != nil {
+			return fmt.Errorf("parse subject delete marker TTL: %w", err)
+		}
+		opts = append(opts, jsm.SubjectDeleteMarkerTTL(d))
+	}
+
+	if spec.AllowMsgCounter {
+		opts = append(opts, func(o *jsmapi.StreamConfig) error {
+			o.AllowMsgCounter = true
+			return nil
+		})
+	}
+
+	if spec.AllowAtomicPublish {
+		opts = append(opts, func(o *jsmapi.StreamConfig) error {
+			o.AllowAtomicPublish = true
+			return nil
+		})
+	}
+
+	if spec.AllowMsgSchedules {
+		opts = append(opts, func(o *jsmapi.StreamConfig) error {
+			o.AllowMsgSchedules = true
+			return nil
+		})
+	}
+
+	if spec.AllowBatched {
+		opts = append(opts, func(o *jsmapi.StreamConfig) error {
+			o.AllowBatchPublish = true
+			return nil
+		})
+	}
+
+	if spec.PersistMode == "async" {
+		opts = append(opts, func(o *jsmapi.StreamConfig) error {
+			o.PersistMode = jsmapi.AsyncPersistMode
+			return nil
+		})
+	} else if spec.PersistMode == "default" {
+		opts = append(opts, func(o *jsmapi.StreamConfig) error {
+			o.PersistMode = jsmapi.DefaultPersistMode
+			return nil
+		})
+	}
+
 	_, err = c.NewStream(ctx, spec.Name, opts)
 	return err
 }
@@ -350,7 +393,12 @@ func updateStream(ctx context.Context, c jsmClient, spec apis.StreamSpec) (err e
 		return err
 	}
 
-	maxAge, err := getMaxAge(spec.MaxAge)
+	maxAge, err := getDurationFromString(spec.MaxAge)
+	if err != nil {
+		return err
+	}
+
+	subjectDeleteMarkerTTL, err := getDurationFromString(spec.SubjectDeleteMarkerTTL)
 	if err != nil {
 		return err
 	}
@@ -364,21 +412,94 @@ func updateStream(ctx context.Context, c jsmClient, spec apis.StreamSpec) (err e
 		return err
 	}
 
-	return js.UpdateConfiguration(jsmapi.StreamConfig{
-		Name:         spec.Name,
-		Retention:    retention,
-		Subjects:     spec.Subjects,
-		MaxConsumers: spec.MaxConsumers,
-		MaxMsgs:      int64(spec.MaxMsgs),
-		MaxBytes:     int64(spec.MaxBytes),
-		MaxAge:       maxAge,
-		MaxMsgSize:   int32(spec.MaxMsgSize),
-		Storage:      storage,
-		Discard:      discard,
-		Replicas:     spec.Replicas,
-		NoAck:        spec.NoAck,
-		Duplicates:   duplicates,
-	})
+	var subjectTransform *jsmapi.SubjectTransformConfig
+	if spec.SubjectTransform != nil {
+		subjectTransform = &jsmapi.SubjectTransformConfig{
+			Source:      spec.SubjectTransform.Source,
+			Destination: spec.SubjectTransform.Dest,
+		}
+	}
+
+	config := jsmapi.StreamConfig{
+		Name:                   spec.Name,
+		Description:            spec.Description,
+		Retention:              retention,
+		Subjects:               spec.Subjects,
+		MaxConsumers:           spec.MaxConsumers,
+		MaxMsgs:                int64(spec.MaxMsgs),
+		MaxBytes:               int64(spec.MaxBytes),
+		MaxMsgsPer:             int64(spec.MaxMsgsPerSubject),
+		MaxAge:                 maxAge,
+		MaxMsgSize:             int32(spec.MaxMsgSize),
+		Storage:                storage,
+		Discard:                discard,
+		DiscardNewPer:          spec.DiscardPerSubject,
+		Replicas:               spec.Replicas,
+		NoAck:                  spec.NoAck,
+		Duplicates:             duplicates,
+		AllowDirect:            spec.AllowDirect,
+		DenyDelete:             spec.DenyDelete,
+		DenyPurge:              spec.DenyPurge,
+		RollupAllowed:          spec.AllowRollup,
+		FirstSeq:               spec.FirstSequence,
+		SubjectTransform:       subjectTransform,
+		AllowMsgTTL:            spec.AllowMsgTTL,
+		SubjectDeleteMarkerTTL: subjectDeleteMarkerTTL,
+		AllowMsgCounter:        spec.AllowMsgCounter,
+		AllowAtomicPublish:     spec.AllowAtomicPublish,
+		AllowMsgSchedules:      spec.AllowMsgSchedules,
+		AllowBatchPublish:      spec.AllowBatched,
+	}
+	if spec.RePublish != nil {
+		config.RePublish = &jsmapi.RePublish{
+			Source:      spec.RePublish.Source,
+			Destination: spec.RePublish.Destination,
+			HeadersOnly: spec.RePublish.HeadersOnly,
+		}
+	}
+	if spec.Mirror != nil {
+		ss, err := getStreamSource(spec.Mirror)
+		if err != nil {
+			return err
+		}
+
+		config.Mirror = ss
+	}
+	config.Sources = make([]*jsmapi.StreamSource, len(spec.Sources))
+	for i, ss := range spec.Sources {
+		jss, err := getStreamSource(ss)
+		if err != nil {
+			return err
+		}
+		config.Sources[i] = jss
+	}
+
+	if spec.Placement != nil {
+		config.Placement = &jsmapi.Placement{
+			Cluster: spec.Placement.Cluster,
+			Tags:    spec.Placement.Tags,
+		}
+	}
+
+	if spec.Metadata != nil {
+		config.Metadata = spec.Metadata
+	}
+
+	switch spec.Compression {
+	case "s2":
+		config.Compression = jsmapi.S2Compression
+	case "none":
+		config.Compression = jsmapi.NoCompression
+	}
+
+	// Handle PersistMode
+	if spec.PersistMode == "async" {
+		config.PersistMode = jsmapi.AsyncPersistMode
+	} else if spec.PersistMode == "default" {
+		config.PersistMode = jsmapi.DefaultPersistMode
+	}
+
+	return js.UpdateConfiguration(config)
 }
 
 func deleteStream(ctx context.Context, c jsmClient, spec apis.StreamSpec) (err error) {
@@ -388,6 +509,11 @@ func deleteStream(ctx context.Context, c jsmClient, spec apis.StreamSpec) (err e
 			err = fmt.Errorf("failed to delete stream %q: %w", name, err)
 		}
 	}()
+
+	if spec.PreventDelete {
+		klog.Infof("Stream %q is configured to preventDelete:\n", name)
+		return nil
+	}
 
 	var apierr jsmapi.ApiError
 	str, err := c.LoadStream(ctx, name)
@@ -406,7 +532,7 @@ func setStreamErrored(ctx context.Context, s *apis.Stream, sif typed.StreamInter
 	}
 
 	sc := s.DeepCopy()
-	sc.Status.Conditions = upsertCondition(sc.Status.Conditions, apis.Condition{
+	sc.Status.Conditions = UpsertCondition(sc.Status.Conditions, apis.Condition{
 		Type:               readyCondType,
 		Status:             k8sapi.ConditionFalse,
 		LastTransitionTime: time.Now().UTC().Format(time.RFC3339Nano),
@@ -417,19 +543,25 @@ func setStreamErrored(ctx context.Context, s *apis.Stream, sif typed.StreamInter
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	res, err := sif.UpdateStatus(ctx, sc, k8smeta.UpdateOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("failed to set stream errored status: %w", err)
-	}
-
-	return res, nil
+	var res *apis.Stream
+	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var err error
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		res, err = sif.UpdateStatus(ctx, sc, k8smeta.UpdateOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to set stream errored status: %w", err)
+		}
+		return nil
+	})
+	return res, err
 }
 
 func setStreamOK(ctx context.Context, s *apis.Stream, i typed.StreamInterface) (*apis.Stream, error) {
 	sc := s.DeepCopy()
 
 	sc.Status.ObservedGeneration = s.Generation
-	sc.Status.Conditions = upsertCondition(sc.Status.Conditions, apis.Condition{
+	sc.Status.Conditions = UpsertCondition(sc.Status.Conditions, apis.Condition{
 		Type:               readyCondType,
 		Status:             k8sapi.ConditionTrue,
 		LastTransitionTime: time.Now().UTC().Format(time.RFC3339Nano),
@@ -440,15 +572,21 @@ func setStreamOK(ctx context.Context, s *apis.Stream, i typed.StreamInterface) (
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	res, err := i.UpdateStatus(ctx, sc, k8smeta.UpdateOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("failed to set stream %q status: %w", s.Spec.Name, err)
-	}
-
-	return res, nil
+	var res *apis.Stream
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var err error
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		res, err = i.UpdateStatus(ctx, sc, k8smeta.UpdateOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to set stream %q status: %w", s.Spec.Name, err)
+		}
+		return nil
+	})
+	return res, err
 }
 
-func getMaxAge(v string) (time.Duration, error) {
+func getDurationFromString(v string) (time.Duration, error) {
 	if v == "" {
 		return time.Duration(0), nil
 	}
@@ -502,7 +640,7 @@ func getStreamSource(ss *apis.StreamSource) (*jsmapi.StreamSource, error) {
 	if ss.OptStartSeq > 0 {
 		jss.OptStartSeq = uint64(ss.OptStartSeq)
 	} else if ss.OptStartTime != "" {
-		t, err := time.Parse(ss.OptStartTime, time.RFC3339)
+		t, err := time.Parse(time.RFC3339, ss.OptStartTime)
 		if err != nil {
 			return nil, err
 		}
@@ -513,6 +651,20 @@ func getStreamSource(ss *apis.StreamSource) (*jsmapi.StreamSource, error) {
 		jss.External = &jsmapi.ExternalStream{
 			ApiPrefix:     ss.ExternalAPIPrefix,
 			DeliverPrefix: ss.ExternalDeliverPrefix,
+		}
+	}
+
+	for _, transform := range ss.SubjectTransforms {
+		jss.SubjectTransforms = append(jss.SubjectTransforms, jsmapi.SubjectTransformConfig{
+			Source:      transform.Source,
+			Destination: transform.Dest,
+		})
+	}
+
+	if ss.Consumer != nil && ss.Consumer.Name != "" {
+		jss.Consumer = &jsmapi.StreamConsumerSource{
+			Name:           ss.Consumer.Name,
+			DeliverSubject: ss.Consumer.DeliverSubject,
 		}
 	}
 

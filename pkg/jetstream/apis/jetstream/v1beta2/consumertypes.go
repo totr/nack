@@ -22,29 +22,41 @@ func (c *Consumer) GetSpec() interface{} {
 
 // ConsumerSpec is the spec for a Consumer resource
 type ConsumerSpec struct {
-	AckPolicy         string   `json:"ackPolicy"`
-	AckWait           string   `json:"ackWait"`
-	Creds             string   `json:"creds"`
-	DeliverGroup      string   `json:"deliverGroup"`
-	DeliverPolicy     string   `json:"deliverPolicy"`
-	DeliverSubject    string   `json:"deliverSubject"`
-	Description       string   `json:"description"`
-	DurableName       string   `json:"durableName"`
-	FilterSubject     string   `json:"filterSubject"`
-	FlowControl       bool     `json:"flowControl"`
-	HeartbeatInterval string   `json:"heartbeatInterval"`
-	MaxAckPending     int      `json:"maxAckPending"`
-	MaxDeliver        int      `json:"maxDeliver"`
-	Nkey              string   `json:"nkey"`
-	OptStartSeq       int      `json:"optStartSeq"`
-	OptStartTime      string   `json:"optStartTime"`
-	RateLimitBps      int      `json:"rateLimitBps"`
-	ReplayPolicy      string   `json:"replayPolicy"`
-	SampleFreq        string   `json:"sampleFreq"`
-	Servers           []string `json:"servers"`
-	StreamName        string   `json:"streamName"`
-	TLS               TLS      `json:"tls"`
-	Account           string   `json:"account"`
+	Description        string            `json:"description,omitempty"`
+	AckPolicy          string            `json:"ackPolicy,omitempty"`
+	AckWait            string            `json:"ackWait,omitempty"`
+	DeliverPolicy      string            `json:"deliverPolicy,omitempty"`
+	DeliverSubject     string            `json:"deliverSubject,omitempty"`
+	DeliverGroup       string            `json:"deliverGroup,omitempty"`
+	DurableName        string            `json:"durableName,omitempty"`
+	FilterSubject      string            `json:"filterSubject,omitempty"`
+	FilterSubjects     []string          `json:"filterSubjects,omitempty"`
+	FlowControl        bool              `json:"flowControl,omitempty"`
+	HeartbeatInterval  string            `json:"heartbeatInterval,omitempty"`
+	MaxAckPending      int               `json:"maxAckPending,omitempty"`
+	MaxDeliver         int               `json:"maxDeliver,omitempty"`
+	BackOff            []string          `json:"backoff,omitempty"`
+	MaxWaiting         int               `json:"maxWaiting,omitempty"`
+	OptStartSeq        int               `json:"optStartSeq,omitempty"`
+	OptStartTime       string            `json:"optStartTime,omitempty"`
+	RateLimitBps       int               `json:"rateLimitBps,omitempty"`
+	ReplayPolicy       string            `json:"replayPolicy,omitempty"`
+	SampleFreq         string            `json:"sampleFreq,omitempty"`
+	HeadersOnly        bool              `json:"headersOnly,omitempty"`
+	MaxRequestBatch    int               `json:"maxRequestBatch,omitempty"`
+	MaxRequestExpires  string            `json:"maxRequestExpires,omitempty"`
+	MaxRequestMaxBytes int               `json:"maxRequestMaxBytes,omitempty"`
+	InactiveThreshold  string            `json:"inactiveThreshold,omitempty"`
+	Replicas           int               `json:"replicas,omitempty"`
+	MemStorage         bool              `json:"memStorage,omitempty"`
+	Metadata           map[string]string `json:"metadata,omitempty"`
+	PauseUntil         string            `json:"pauseUntil,omitempty"`
+	PriorityPolicy     string            `json:"priorityPolicy,omitempty"`
+	PinnedTTL          string            `json:"pinnedTtl,omitempty"`
+	PriorityGroups     []string          `json:"priorityGroups,omitempty"`
+
+	StreamName string `json:"streamName"`
+	BaseStreamConfig
 }
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
